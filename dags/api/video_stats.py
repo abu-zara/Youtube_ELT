@@ -1,36 +1,88 @@
 import requests 
 import json
 from datetime import date
-import os
-from dotenv import load_dotenv
+# import os
+# from dotenv import load_dotenv
 
-load_dotenv(dotenv_path="./.env")
+from airflow.decorators import task
+from airflow.models import Variable
 
-API_KEY = os.getenv("API_KEY")
-CHANNEL_HANDLE = "MrBeast"
+# load_dotenv(dotenv_path="./.env")
+
+API_KEY = Variable.get("API_KEY")
+CHANNEL_HANDLE = Variable.get("CHANNEL_HANDLE")
 maxResults = 50
 
+@task
 def get_playlist_id():
     try:
+        handle = CHANNEL_HANDLE.lstrip("@")
 
-        url = f"https://youtube.googleapis.com/youtube/v3/channels?part=contentDetails&forHandle={CHANNEL_HANDLE}&key={API_KEY}"
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        # print(json.dumps(data,indent=4))
+        # Try forHandle first
+        url = f"https://youtube.googleapis.com/youtube/v3/channels?part=contentDetails&forHandle={handle}&key={API_KEY}"
+        r = requests.get(url)
+        r.raise_for_status()
+        data = r.json()
 
-        channel_items = data['items'][0]
-        channel_playlistId = channel_items['contentDetails']['relatedPlaylists']['uploads']
-        # print(channel_playlistId)
-        return channel_playlistId
-        
+        items = data.get("items", [])
+        if items:
+            return items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+
+        # Fallback: resolve channelId via search
+        s_url = f"https://youtube.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=1&q={handle}&key={API_KEY}"
+        s = requests.get(s_url)
+        s.raise_for_status()
+        sdata = s.json()
+
+        sitems = sdata.get("items", [])
+        if not sitems:
+            raise Exception(
+                f"Could not resolve channel from handle={handle}. "
+                f"channels(forHandle) items=0; search items=0. "
+                f"channels response: {json.dumps(data)[:1200]} "
+                f"search response: {json.dumps(sdata)[:1200]}"
+            )
+
+        channel_id = sitems[0]["snippet"]["channelId"]
+
+        # Get uploads playlist by channel ID (most reliable)
+        c_url = f"https://youtube.googleapis.com/youtube/v3/channels?part=contentDetails&id={channel_id}&key={API_KEY}"
+        c = requests.get(c_url)
+        c.raise_for_status()
+        cdata = c.json()
+
+        citems = cdata.get("items", [])
+        if not citems:
+            raise Exception(f"Resolved channelId={channel_id} but channels?id returned 0 items. Response: {json.dumps(cdata)[:1200]}")
+
+        return citems[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+
     except requests.exceptions.RequestException as e:
         raise e
 
+# def get_playlist_id():
+#     try:
+
+#         url = f"https://youtube.googleapis.com/youtube/v3/channels?part=contentDetails&forHandle={CHANNEL_HANDLE}&key={API_KEY}"
+#         response = requests.get(url)
+#         response.raise_for_status()
+#         data = response.json()
+#         # print(json.dumps(data,indent=4))
+
+#         channel_items = data['items'][0]
+#         channel_playlistId = channel_items['contentDetails']['relatedPlaylists']['uploads']
+#         # print(channel_playlistId)
+#         return channel_playlistId
+        
+#     except requests.exceptions.RequestException as e:
+#         raise e
+    
+@task
 def get_video_ids(playlistId):
      base_url = f"https://youtube.googleapis.com/youtube/v3/playlistItems?part=contentDetails&maxResults={maxResults}&playlistId={playlistId}&key={API_KEY}"
      video_ids = []
-     pageToken = None
+     pageToken = None  # ✅ MUST exist before "if pageToken:"
+
 
      try:
           while True:
@@ -54,6 +106,7 @@ def get_video_ids(playlistId):
      except requests.exceptions.RequestException as e:
           raise e
 
+@task
 def extract_video_data(video_ids):
      extracted_data = []
 
@@ -90,6 +143,7 @@ def extract_video_data(video_ids):
      except requests.exceptions.RequestException as e:
          raise e 
 
+@task
 def save_to_json(extracted_data):
     file_path = f"./data/Youtube_data_{date.today()}.json"
 
